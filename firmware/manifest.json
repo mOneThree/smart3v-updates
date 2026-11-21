@@ -6,12 +6,12 @@
       "name": "Smart 3V LED String",
       "vendor_id": 65521,
       "product_id": 32769,
-      "version": 3,
-      "version_string": "3c.3-effects",
-      "file": "smart3v-fff1-8001-v3.ota",
-      "size": 1700600,
-      "sha256": "1d1625bca183b118c26240e19f08e965d8e6c1392d3f440ea0905450dc429361",
-      "notes": "Effect selector (Steady / Breathing / Flashing / Slow breathing) and a Slow breathing switch."
+      "version": 4,
+      "version_string": "3c.4-effects",
+      "file": "smart3v-fff1-8001-v4.ota",
+      "size": 1700536,
+      "sha256": "483102dbd0c270481016d5718202043b77c5cf12d5d863315c53c85cac8792f5",
+      "notes": "Version bump only; no behaviour change. First automatic delivery test."
     }
   ]
 }
