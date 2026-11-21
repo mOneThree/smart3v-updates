@@ -1,0 +1,22 @@
+configuration:
+  check_interval_minutes:
+    name: Check every (minutes)
+    description: How often to look for a new firmware version. The check downloads a very small file.
+  restart_matter_server:
+    name: Restart the Matter Server
+    description: >-
+      The Matter Server only picks up new firmware files when it starts. "immediately" restarts it
+      as soon as a new file has been downloaded; "quiet_time" waits until the time below.
+      Matter devices are unavailable for about a minute during the restart.
+  quiet_time:
+    name: Quiet time (HH:MM)
+    description: When to restart the Matter Server if "quiet_time" is selected. Home Assistant's time zone.
+  scan_wait_minutes:
+    name: Wait before refreshing (minutes)
+    description: The Matter Server scans for updates about 10 minutes after it starts. After this wait the Firmware entities are refreshed.
+  manifest_url:
+    name: Version list address (advanced)
+    description: Leave empty to use the official Smart 3V updates repository.
+  matter_server_slug:
+    name: Matter Server app id (advanced)
+    description: Leave empty for the official Matter Server app (core_matter_server).

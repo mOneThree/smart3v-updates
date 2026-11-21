@@ -1,0 +1,226 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Smart 3V Updater
+#
+# 1. Reads the version list (manifest.json) from the Smart 3V updates repository.
+# 2. Downloads any firmware newer than the last one it delivered, and checks its
+#    size and SHA-256.
+# 3. Puts the file in the Matter Server's "updates" folder and restarts the Matter
+#    Server (it only imports update files when it starts).
+# 4. Waits for the Matter Server's first update scan, then refreshes the Matter
+#    "Firmware" entities so the update shows on each board's page.
+#
+# Installing an update on a board is always a manual click in Home Assistant.
+# Restart this app to check right now.
+# ==============================================================================
+
+DEFAULT_MANIFEST="https://raw.githubusercontent.com/mOneThree/smart3v-updates/main/firmware/manifest.json"
+STATE_FILE="/data/delivered.json"
+PENDING_DIR="/data/pending"
+
+MANIFEST_URL="$(bashio::config 'manifest_url' "${DEFAULT_MANIFEST}")"
+[ -z "${MANIFEST_URL}" ] || [ "${MANIFEST_URL}" = "null" ] && MANIFEST_URL="${DEFAULT_MANIFEST}"
+MATTER_SLUG="$(bashio::config 'matter_server_slug' 'core_matter_server')"
+[ -z "${MATTER_SLUG}" ] || [ "${MATTER_SLUG}" = "null" ] && MATTER_SLUG="core_matter_server"
+INTERVAL_MIN="$(bashio::config 'check_interval_minutes' '5')"
+RESTART_MODE="$(bashio::config 'restart_matter_server' 'immediately')"
+QUIET_TIME="$(bashio::config 'quiet_time' '03:00')"
+SCAN_WAIT_MIN="$(bashio::config 'scan_wait_minutes' '11')"
+
+# Firmware files are only ever downloaded from the folder the version list is in.
+BASE_URL="${MANIFEST_URL%/*}"
+
+mkdir -p "${PENDING_DIR}"
+[ -f "${STATE_FILE}" ] || echo '{}' > "${STATE_FILE}"
+
+supervisor_api() { # method path
+    curl -sS -m 60 -X "$1" -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+        -H "Content-Type: application/json" "http://supervisor$2"
+}
+
+core_api() { # method path [json body]
+    if [ -n "${3:-}" ]; then
+        curl -sS -m 60 -X "$1" -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+            -H "Content-Type: application/json" -d "$3" "http://supervisor/core/api$2"
+    else
+        curl -sS -m 60 -X "$1" -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+            -H "Content-Type: application/json" "http://supervisor/core/api$2"
+    fi
+}
+
+# Where the Matter Server's own config folder is mounted inside this app
+find_updates_dir() {
+    local base
+    for base in /addon_configs /app_configs /all_addon_configs /all_app_configs; do
+        if [ -d "${base}/${MATTER_SLUG}" ]; then
+            echo "${base}/${MATTER_SLUG}/updates"
+            return 0
+        fi
+    done
+    base="$(find / -maxdepth 3 -type d -name "${MATTER_SLUG}" -not -path '/proc/*' -not -path '/sys/*' 2>/dev/null | head -n 1)"
+    if [ -n "${base}" ]; then
+        echo "${base}/updates"
+        return 0
+    fi
+    return 1
+}
+
+check_matter_server() {
+    local info
+    info="$(supervisor_api GET "/addons/${MATTER_SLUG}/info" 2>/dev/null)"
+    if [ "$(echo "${info}" | jq -r '.result // empty' 2>/dev/null)" != "ok" ]; then
+        bashio::log.warning "Could not read the Matter Server app (${MATTER_SLUG}). Is it installed?"
+        return
+    fi
+    if [ "$(echo "${info}" | jq -r '.data.options.enable_test_net_dcl // false')" != "true" ]; then
+        bashio::log.warning "The Matter Server option 'enable_test_net_dcl' is OFF. It ignores custom firmware files until you turn it on:"
+        bashio::log.warning "Settings > Apps (Add-ons) > Matter Server > Configuration > enable_test_net_dcl, then restart the Matter Server."
+    fi
+}
+
+# Current HH:MM in Home Assistant's time zone
+local_hhmm() {
+    local tz
+    tz="$(core_api GET /config 2>/dev/null | jq -r '.time_zone // empty' 2>/dev/null)"
+    if [ -n "${tz}" ] && [ -e "/usr/share/zoneinfo/${tz}" ]; then
+        TZ="${tz}" date +%H:%M
+    else
+        date +%H:%M
+    fi
+}
+
+in_quiet_window() {
+    # true during the check interval that starts at QUIET_TIME
+    local now_m quiet_m diff
+    now_m=$(( 10#$(local_hhmm | cut -d: -f1) * 60 + 10#$(local_hhmm | cut -d: -f2) ))
+    quiet_m=$(( 10#${QUIET_TIME%%:*} * 60 + 10#${QUIET_TIME##*:} ))
+    diff=$(( (now_m - quiet_m + 1440) % 1440 ))
+    [ "${diff}" -lt "$(( INTERVAL_MIN > 15 ? INTERVAL_MIN : 15 ))" ]
+}
+
+# Downloads every firmware in the version list that is newer than what was
+# delivered before into PENDING_DIR. Prints nothing; returns 0 when done.
+fetch_new_firmware() {
+    local manifest count i vid pid version vstring file size sha key last tmp got_sha got_size
+    manifest="$(curl -fsSL -m 60 "${MANIFEST_URL}")" || {
+        bashio::log.warning "Could not download the version list (${MANIFEST_URL}). Will try again."
+        return 1
+    }
+    if ! echo "${manifest}" | jq -e '.firmware | type == "array"' > /dev/null 2>&1; then
+        bashio::log.warning "The version list is not in the expected format. Ignoring it."
+        return 1
+    fi
+    count="$(echo "${manifest}" | jq '.firmware | length')"
+    for (( i = 0; i < count; i++ )); do
+        vid="$(echo "${manifest}" | jq -r ".firmware[$i].vendor_id")"
+        pid="$(echo "${manifest}" | jq -r ".firmware[$i].product_id")"
+        version="$(echo "${manifest}" | jq -r ".firmware[$i].version")"
+        vstring="$(echo "${manifest}" | jq -r ".firmware[$i].version_string")"
+        file="$(echo "${manifest}" | jq -r ".firmware[$i].file")"
+        size="$(echo "${manifest}" | jq -r ".firmware[$i].size")"
+        sha="$(echo "${manifest}" | jq -r ".firmware[$i].sha256")"
+
+        if ! [[ "${vid}" =~ ^[0-9]+$ && "${pid}" =~ ^[0-9]+$ && "${version}" =~ ^[0-9]+$ && "${size}" =~ ^[0-9]+$ ]] ||
+            ! [[ "${file}" =~ ^[A-Za-z0-9._-]+\.ota$ ]] || ! [[ "${sha}" =~ ^[0-9a-f]{64}$ ]]; then
+            bashio::log.warning "Skipping an entry in the version list that is not valid."
+            continue
+        fi
+
+        key="${vid}:${pid}"
+        last="$(jq -r --arg k "${key}" '.[$k] // 0' "${STATE_FILE}")"
+        if [ "${version}" -le "${last}" ] || [ -f "${PENDING_DIR}/${file}" ]; then
+            continue
+        fi
+
+        bashio::log.info "New firmware ${vstring} (version ${version}) for vendor ${vid} / product ${pid}. Downloading ${file}..."
+        tmp="${PENDING_DIR}/.download"
+        if ! curl -fsSL -m 600 -o "${tmp}" "${BASE_URL}/${file}"; then
+            bashio::log.warning "Download failed. Will try again."
+            rm -f "${tmp}"
+            continue
+        fi
+        got_size="$(stat -c %s "${tmp}")"
+        got_sha="$(sha256sum "${tmp}" | cut -d' ' -f1)"
+        if [ "${got_size}" != "${size}" ] || [ "${got_sha}" != "${sha}" ]; then
+            bashio::log.error "Downloaded file does not match the version list (size or checksum). It was thrown away."
+            rm -f "${tmp}"
+            continue
+        fi
+        mv "${tmp}" "${PENDING_DIR}/${file}"
+        echo "${key} ${version} ${vstring}" > "${PENDING_DIR}/${file}.meta"
+        bashio::log.info "Downloaded and checked ${file}."
+    done
+    return 0
+}
+
+refresh_firmware_entities() {
+    local entities body
+    entities="$(core_api POST /template \
+        '{"template":"{{ integration_entities(\"matter\") | select(\"match\", \"^update\\\\.\") | list | tojson }}"}' 2>/dev/null)"
+    if ! echo "${entities}" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1; then
+        bashio::log.warning "No Matter firmware entities found to refresh (or Home Assistant did not answer)."
+        return
+    fi
+    body="$(jq -cn --argjson e "${entities}" '{entity_id: $e}')"
+    core_api POST /services/homeassistant/update_entity "${body}" > /dev/null 2>&1
+    bashio::log.info "Refreshed $(echo "${entities}" | jq 'length') Matter firmware entities. New versions now show on each board's Firmware page."
+}
+
+# Hands the downloaded files to the Matter Server
+deliver_pending() {
+    local updates_dir f meta key version vstring result delivered=0
+    shopt -s nullglob
+    local files=("${PENDING_DIR}"/*.ota)
+    shopt -u nullglob
+    [ "${#files[@]}" -eq 0 ] && return 0
+
+    if [ "${RESTART_MODE}" = "quiet_time" ] && ! in_quiet_window; then
+        return 0 # keep the files until the quiet time
+    fi
+
+    if ! updates_dir="$(find_updates_dir)"; then
+        bashio::log.error "Could not find the Matter Server's folder. Is the Matter Server app installed and started once?"
+        return 1
+    fi
+    mkdir -p "${updates_dir}"
+
+    for f in "${files[@]}"; do
+        meta="$(cat "${f}.meta" 2>/dev/null)"
+        cp "${f}" "${updates_dir}/$(basename "${f}")" || {
+            bashio::log.error "Could not copy $(basename "${f}") into ${updates_dir}."
+            return 1
+        }
+        delivered=1
+    done
+    [ "${delivered}" -eq 1 ] || return 0
+
+    bashio::log.info "Restarting the Matter Server so it imports the new firmware. Matter devices are unavailable for about a minute."
+    result="$(supervisor_api POST "/addons/${MATTER_SLUG}/restart" 2>/dev/null | jq -r '.result // empty' 2>/dev/null)"
+    if [ "${result}" != "ok" ]; then
+        bashio::log.error "The Matter Server restart did not succeed. Restart it by hand; the files are in its updates folder."
+    fi
+
+    # Remember what was delivered, so it is not downloaded again
+    for f in "${files[@]}"; do
+        read -r key version vstring < "${f}.meta"
+        if [ -n "${key}" ] && [[ "${version}" =~ ^[0-9]+$ ]]; then
+            jq --arg k "${key}" --argjson v "${version}" '.[$k] = $v' "${STATE_FILE}" > "${STATE_FILE}.tmp" &&
+                mv "${STATE_FILE}.tmp" "${STATE_FILE}"
+        fi
+        rm -f "${f}" "${f}.meta"
+    done
+
+    bashio::log.info "Waiting ${SCAN_WAIT_MIN} minutes for the Matter Server's update scan..."
+    sleep "$(( SCAN_WAIT_MIN * 60 ))"
+    refresh_firmware_entities
+}
+
+# ------------------------------------------------------------------------------
+bashio::log.info "Smart 3V Updater started. Checking ${MANIFEST_URL} every ${INTERVAL_MIN} min; Matter Server restart: ${RESTART_MODE}."
+check_matter_server
+
+while true; do
+    fetch_new_firmware
+    deliver_pending
+    sleep "$(( INTERVAL_MIN * 60 ))"
+done
