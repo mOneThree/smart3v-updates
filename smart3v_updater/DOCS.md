@@ -15,15 +15,28 @@ yourself on each board.
 ## What happens
 
 1. Every few minutes (5 by default) the app downloads a small version list.
-2. When there is a firmware newer than the last one it delivered, it downloads the
-   file and checks its size and checksum.
-3. It copies the file into the Matter Server's `updates` folder and restarts the
-   Matter Server. Matter devices are unavailable for about a minute.
-4. About 11 minutes later it refreshes the Matter firmware entities. The update is
+2. When there is a firmware newer than the last one it delivered, it first looks at
+   your Smart 3V boards in Home Assistant. If every board already runs that version,
+   it does nothing (no restart). This is what normally happens when you first install
+   the app.
+3. Otherwise it downloads the file and checks its size and checksum.
+4. It copies the file into the Matter Server's `updates` folder and restarts the
+   Matter Server. Matter devices are unavailable for about a minute. If the restart
+   does not go through, it tries three times and then again at the next check.
+5. It checks that the Matter Server took the file (the file disappears from the
+   `updates` folder) and says so in the log.
+6. About 11 minutes later it refreshes the Matter firmware entities. The update is
    then offered on every matching board.
 
-The first time the app runs it delivers the current firmware once, which restarts the
-Matter Server one time even if your boards are already up to date.
+If the app cannot see any Smart 3V board (none paired yet, or Home Assistant does not
+answer), it delivers the firmware anyway, so nothing is ever missed.
+
+### Quiet time
+
+With **Restart the Matter Server** set to `quiet_time`, a new firmware is downloaded
+straight away but only handed to the Matter Server in the 15 minutes after the quiet
+time (or one check interval, if that is longer). If Home Assistant is off at that
+moment, it waits for the next day.
 
 ## Options
 

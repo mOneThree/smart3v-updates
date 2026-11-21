@@ -1,5 +1,5 @@
 name: Smart 3V Updater
-version: "0.1.1"
+version: "0.2.0"
 slug: smart3v_updater
 description: Fetches new Smart 3V firmware and hands it to the Matter Server, so updates show up on each board's page.
 url: "https://github.com/mOneThree/smart3v-updates"

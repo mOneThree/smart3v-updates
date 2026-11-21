@@ -26,6 +26,8 @@ INTERVAL_MIN="$(bashio::config 'check_interval_minutes' '5')"
 RESTART_MODE="$(bashio::config 'restart_matter_server' 'immediately')"
 QUIET_TIME="$(bashio::config 'quiet_time' '03:00')"
 SCAN_WAIT_MIN="$(bashio::config 'scan_wait_minutes' '11')"
+RETRY_WAIT_S="${RETRY_WAIT_S:-30}"     # between Matter Server restart attempts
+IMPORT_WAIT_S="${IMPORT_WAIT_S:-300}"  # how long to watch for the import
 
 # Firmware files are only ever downloaded from the folder the version list is in.
 BASE_URL="${MANIFEST_URL%/*}"
@@ -92,16 +94,56 @@ local_hhmm() {
 in_quiet_window() {
     # true during the check interval that starts at QUIET_TIME
     local now_m quiet_m diff
-    now_m=$(( 10#$(local_hhmm | cut -d: -f1) * 60 + 10#$(local_hhmm | cut -d: -f2) ))
+    local hhmm
+    hhmm="$(local_hhmm)"
+    now_m=$(( 10#${hhmm%%:*} * 60 + 10#${hhmm##*:} ))
     quiet_m=$(( 10#${QUIET_TIME%%:*} * 60 + 10#${QUIET_TIME##*:} ))
     diff=$(( (now_m - quiet_m + 1440) % 1440 ))
     [ "${diff}" -lt "$(( INTERVAL_MIN > 15 ? INTERVAL_MIN : 15 ))" ]
 }
 
+remember_delivered() { # key version
+    jq --arg k "$1" --argjson v "$2" '.[$k] = $v' "${STATE_FILE}" > "${STATE_FILE}.tmp" &&
+        mv "${STATE_FILE}.tmp" "${STATE_FILE}"
+}
+
+drop_pending_for() { # key
+    local m k
+    shopt -s nullglob
+    for m in "${PENDING_DIR}"/*.ota.meta; do
+        read -r k _ < "${m}"
+        if [ "${k}" = "$1" ]; then
+            rm -f "${m%.meta}" "${m}"
+        fi
+    done
+    shopt -u nullglob
+}
+
+# Lists every Matter firmware entity with its device's maker, model and installed version
+BOARDS_TEMPLATE='{% set ns = namespace(out=[]) %}{% for e in integration_entities("matter") | select("match", "^update\\.") %}{% set d = device_id(e) %}{% set ns.out = ns.out + [{"entity": e, "manufacturer": device_attr(d, "manufacturer"), "model": device_attr(d, "model"), "installed": state_attr(e, "installed_version")}] %}{% endfor %}{{ ns.out | tojson }}'
+
+# True (0) only when Home Assistant shows at least one board of this model and all
+# of them already run this version. Then there is nothing to hand over, and the
+# Matter Server is not restarted. In every other case (no answer, no board found,
+# a board on another version) the firmware is delivered as usual.
+boards_all_on() { # model version_string
+    local boards total behind
+    [ -n "$1" ] || return 1
+    boards="$(core_api POST /template "$(jq -cn --arg t "${BOARDS_TEMPLATE}" '{template: $t}')" 2>/dev/null)"
+    echo "${boards}" | jq -e 'type == "array"' > /dev/null 2>&1 || return 1
+    total="$(echo "${boards}" | jq --arg m "$1" '[.[] | select(.model == $m)] | length')"
+    behind="$(echo "${boards}" | jq --arg m "$1" --arg v "$2" '[.[] | select(.model == $m and .installed != $v)] | length')"
+    if [ "${total}" -gt 0 ] && [ "${behind}" -eq 0 ]; then
+        bashio::log.info "All ${total} '$1' board(s) already run $2. Nothing to deliver; the Matter Server is not restarted."
+        return 0
+    fi
+    return 1
+}
+
 # Downloads every firmware in the version list that is newer than what was
 # delivered before into PENDING_DIR. Prints nothing; returns 0 when done.
 fetch_new_firmware() {
-    local manifest count i vid pid version vstring file size sha key last tmp got_sha got_size
+    local manifest count i vid pid version vstring file size sha key last tmp got_sha got_size model
     manifest="$(curl -fsSL -m 60 "${MANIFEST_URL}")" || {
         bashio::log.warning "Could not download the version list (${MANIFEST_URL}). Will try again."
         return 1
@@ -132,6 +174,15 @@ fetch_new_firmware() {
             continue
         fi
 
+        model="$(echo "${manifest}" | jq -r ".firmware[$i] | .model // .name // empty")"
+        if boards_all_on "${model}" "${vstring}"; then
+            remember_delivered "${key}" "${version}"
+            continue
+        fi
+
+        # A newer file replaces one still waiting for the quiet time
+        drop_pending_for "${key}"
+
         bashio::log.info "New firmware ${vstring} (version ${version}) for vendor ${vid} / product ${pid}. Downloading ${file}..."
         tmp="${PENDING_DIR}/.download"
         if ! curl -fsSL -m 600 -o "${tmp}" "${BASE_URL}/${file}"; then
@@ -149,6 +200,9 @@ fetch_new_firmware() {
         mv "${tmp}" "${PENDING_DIR}/${file}"
         echo "${key} ${version} ${vstring}" > "${PENDING_DIR}/${file}.meta"
         bashio::log.info "Downloaded and checked ${file}."
+        if [ "${RESTART_MODE}" = "quiet_time" ]; then
+            bashio::log.info "It will be handed to the Matter Server at the quiet time (${QUIET_TIME})."
+        fi
     done
     return 0
 }
@@ -195,20 +249,44 @@ deliver_pending() {
     [ "${delivered}" -eq 1 ] || return 0
 
     bashio::log.info "Restarting the Matter Server so it imports the new firmware. Matter devices are unavailable for about a minute."
-    result="$(supervisor_api POST "/addons/${MATTER_SLUG}/restart" 2>/dev/null | jq -r '.result // empty' 2>/dev/null)"
+    local attempt
+    for attempt in 1 2 3; do
+        result="$(supervisor_api POST "/addons/${MATTER_SLUG}/restart" 2>/dev/null | jq -r '.result // empty' 2>/dev/null)"
+        [ "${result}" = "ok" ] && break
+        bashio::log.warning "The Matter Server restart did not go through (try ${attempt} of 3)."
+        [ "${attempt}" -lt 3 ] && sleep "${RETRY_WAIT_S}"
+    done
     if [ "${result}" != "ok" ]; then
-        bashio::log.error "The Matter Server restart did not succeed. Restart it by hand; the files are in its updates folder."
+        bashio::log.error "Could not restart the Matter Server. Will try again at the next check. You can also restart it by hand; the files are already in its updates folder."
+        return 1
     fi
 
     # Remember what was delivered, so it is not downloaded again
     for f in "${files[@]}"; do
         read -r key version vstring < "${f}.meta"
         if [ -n "${key}" ] && [[ "${version}" =~ ^[0-9]+$ ]]; then
-            jq --arg k "${key}" --argjson v "${version}" '.[$k] = $v' "${STATE_FILE}" > "${STATE_FILE}.tmp" &&
-                mv "${STATE_FILE}.tmp" "${STATE_FILE}"
+            remember_delivered "${key}" "${version}"
         fi
         rm -f "${f}" "${f}.meta"
     done
+
+    # The Matter Server removes a file from its updates folder once it has imported it
+    local waited=0 left
+    while [ "${waited}" -lt "${IMPORT_WAIT_S}" ]; do
+        sleep 10
+        waited=$(( waited + 10 ))
+        left=0
+        for f in "${files[@]}"; do
+            [ -e "${updates_dir}/$(basename "${f}")" ] && left=1
+        done
+        [ "${left}" -eq 0 ] && break
+    done
+    if [ "${left}" -eq 0 ]; then
+        bashio::log.info "The Matter Server imported the new firmware."
+    else
+        bashio::log.warning "The firmware file is still in the Matter Server's updates folder after ${IMPORT_WAIT_S} s, so it was probably not imported."
+        bashio::log.warning "Check that 'enable_test_net_dcl' is on and look at the Matter Server log. It will try again the next time the Matter Server starts."
+    fi
 
     bashio::log.info "Waiting ${SCAN_WAIT_MIN} minutes for the Matter Server's update scan..."
     sleep "$(( SCAN_WAIT_MIN * 60 ))"
