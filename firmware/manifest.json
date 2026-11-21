@@ -6,12 +6,12 @@
       "name": "Smart 3V LED String",
       "vendor_id": 65521,
       "product_id": 32769,
-      "version": 4,
-      "version_string": "3c.4-effects",
-      "file": "smart3v-fff1-8001-v4.ota",
-      "size": 1700536,
-      "sha256": "483102dbd0c270481016d5718202043b77c5cf12d5d863315c53c85cac8792f5",
-      "notes": "Version bump only; no behaviour change. First automatic delivery test."
+      "version": 5,
+      "version_string": "3c.5-effects",
+      "file": "smart3v-fff1-8001-v5.ota",
+      "size": 1700712,
+      "sha256": "3d33454b634f1836f9e5be6f761f9f1431a81d2bbafc0e3ce676179c8fd6ffa1",
+      "notes": "Board ID fix: the ID is now the last 3 bytes of the chip MAC (was FFFExx). Prints the chip MAC at start-up. Pairing codes are unchanged."
     }
   ]
 }
