@@ -25,3 +25,10 @@ Details: [smart3v_updater/DOCS.md](smart3v_updater/DOCS.md).
 
 These boards use Matter test credentials (vendor ID 0xFFF1). They are hobby devices,
 not certified Matter products.
+
+## Board setup page
+
+`flasher/` is a web page for the first USB install of a new board (Chrome or Edge on a
+computer). It erases the board, installs the firmware, reads the board's ID and pairing
+code and keeps a list in the browser. It needs https or localhost; to run it locally:
+`python -m http.server 8000` inside `flasher/`, then open `http://localhost:8000`.
