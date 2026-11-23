@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "updated": "2026-11-21",
+  "updated": "2026-11-23",
   "firmware": [
     {
       "name": "Smart 3V LED String",
       "vendor_id": 65521,
       "product_id": 32769,
-      "version": 5,
-      "version_string": "3c.5-effects",
-      "file": "smart3v-fff1-8001-v5.ota",
-      "size": 1700712,
-      "sha256": "3d33454b634f1836f9e5be6f761f9f1431a81d2bbafc0e3ce676179c8fd6ffa1",
-      "notes": "Board ID fix: the ID is now the last 3 bytes of the chip MAC (was FFFExx). Prints the chip MAC at start-up. Pairing codes are unchanged."
+      "version": 6,
+      "version_string": "3c.6-effects",
+      "file": "smart3v-fff1-8001-v6.ota",
+      "size": 1701400,
+      "sha256": "9ae48000742087bc55a834250e91520d5c784fcdbde07752fc5b2fc5055f2a22",
+      "notes": "Effects start in step when changed together (and when the light turns on), smooth fades for on/off and brightness, Identify blinks the LED string, the pairing code is printed in the USB log at every start. Pairing codes unchanged."
     }
   ]
 }
